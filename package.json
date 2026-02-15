@@ -1,0 +1,17 @@
+{
+  "name": "zing88-api",
+  "version": "1.1.0",
+  "description": "WebSocket client + Express API cho game tài xỉu Zing88, có dự đoán nâng cao",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "ws": "^8.14.2"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
