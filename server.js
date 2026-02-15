@@ -1,0 +1,690 @@
+const WebSocket = require('ws');
+const express = require('express');
+const cors = require('cors');
+
+class GameWebSocketClient {
+    constructor(url) {
+        this.url = url;
+        this.ws = null;
+        this.reconnectAttempts = 0;
+        this.maxReconnectAttempts = 5;
+        this.reconnectDelay = 5000;
+        this.isAuthenticated = false;
+        this.sessionId = null;
+        this.latestTxData = null;
+        this.latestMd5Data = null;
+        this.lastUpdateTime = { tx: null, md5: null };
+        this.historyTx = [];          // Lịch sử bàn tài xỉu thường
+        this.historyMd5 = [];         // Lịch sử bàn MD5
+        this.maxHistorySize = 100;    // Số phiên tối đa lưu trữ
+    }
+
+    connect() {
+        console.log('🔗 Connecting to WebSocket server...');
+        this.ws = new WebSocket(this.url, {
+            headers: {
+                'Host': 'api.khuatuish.vip',
+                'Origin': 'https://play.zing88a.vin',
+                'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36',
+                'Pragma': 'no-cache',
+                'Cache-Control': 'no-cache',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Accept-Language': 'vi-VN,vi;q=0.9,fr-FR;q=0.8,fr;q=0.7,en-US;q=0.6,en;q=0.5',
+                'Sec-WebSocket-Extensions': 'permessage-deflate; client_max_window_bits',
+                'Sec-WebSocket-Version': '13'
+            }
+        });
+        this.setupEventHandlers();
+    }
+
+    setupEventHandlers() {
+        this.ws.on('open', () => {
+            console.log('✅ Connected to WebSocket server');
+            this.reconnectAttempts = 0;
+            this.sendAuthentication();
+        });
+
+        this.ws.on('message', (data) => {
+            this.handleMessage(data);
+        });
+
+        this.ws.on('error', (error) => {
+            console.error('❌ WebSocket error:', error.message);
+        });
+
+        this.ws.on('close', (code, reason) => {
+            console.log(`🔌 Connection closed. Code: ${code}, Reason: ${String(reason)}`);
+            this.isAuthenticated = false;
+            this.sessionId = null;
+            this.handleReconnect();
+        });
+
+        this.ws.on('pong', () => {
+            console.log('❤️  Heartbeat received from server');
+        });
+    }
+
+    sendAuthentication() {
+        console.log('🔐 Sending authentication...');
+        const authMessage = [
+            1,
+            "MiniGame",
+            "apizing88",
+            "WangLin1@",
+            {
+                "signature": "3F4F57DF2E2F45E99EE528257F6F235C30831733BFC66DD9BE33436A3F78D18E5093BB5F8514CA99C245B3F480B092DEF4EA0CF91E7FDA7DF9A2EF2893FDA44D9C169A0167F9E759CC76E9F50CD6345BA99337B7FB43C9183D0C3F96C3CF37CBF477D1D370BE741F2E1039DD544C119B9997552FC7F2F1B18F4E10604B7C19DC",
+                "info": {
+                    "cs": "4369fabdc2860f5e50d66e44ab94b3c0",
+                    "phone": "",
+                    "ipAddress": "113.185.46.68",
+                    "isMerchant": false,
+                    "userId": "03edac1f-20a2-4f00-9dda-8fc8a398c40a",
+                    "deviceId": "050105373613900053736078036024",
+                    "isMktAccount": false,
+                    "username": "apizing88",
+                    "timestamp": 1766556654268
+                },
+                "pid": 4
+            }
+        ];
+        this.sendRaw(authMessage);
+    }
+
+    sendPluginMessages() {
+        console.log('🚀 Sending plugin initialization messages...');
+        const pluginMessages = [
+            [6,"MiniGame","taixiuPlugin",{"cmd":1005}],
+            [6,"MiniGame","taixiuMd5Plugin",{"cmd":1105}],
+            [6,"MiniGame","lobbyPlugin",{"cmd":10001}],
+            [6,"MiniGame","channelPlugin",{"cmd":310}]
+        ];
+        pluginMessages.forEach((message, index) => {
+            setTimeout(() => {
+                console.log(`📤 Sending plugin ${index + 1}/${pluginMessages.length}: ${message[2]}`);
+                this.sendRaw(message);
+            }, index * 1000);
+        });
+        setInterval(() => {
+            this.refreshGameData();
+        }, 30000);
+    }
+
+    refreshGameData() {
+        if (this.isAuthenticated && this.ws && this.ws.readyState === WebSocket.OPEN) {
+            console.log('🔄 Refreshing game data...');
+            const refreshTx = [6, "MiniGame", "taixiuPlugin", { "cmd": 1005 }];
+            const refreshMd5 = [6, "MiniGame", "taixiuMd5Plugin", { "cmd": 1105 }];
+            this.sendRaw(refreshTx);
+            setTimeout(() => {
+                this.sendRaw(refreshMd5);
+            }, 1000);
+        }
+    }
+
+    sendRaw(data) {
+        if (this.ws.readyState === WebSocket.OPEN) {
+            const jsonString = JSON.stringify(data);
+            this.ws.send(jsonString);
+            console.log('📤 Sent raw:', jsonString);
+            return true;
+        } else {
+            console.log('⚠️ Cannot send, WebSocket not open');
+            return false;
+        }
+    }
+
+    // Cập nhật lịch sử
+    updateHistory(historyArray, newSessions, type) {
+        if (!newSessions || newSessions.length === 0) return;
+        const existingSids = new Set(historyArray.map(s => s.sid));
+        for (const session of newSessions) {
+            if (!existingSids.has(session.sid)) {
+                historyArray.push(session);
+                existingSids.add(session.sid);
+            }
+        }
+        historyArray.sort((a, b) => b.sid - a.sid);
+        if (historyArray.length > this.maxHistorySize) {
+            historyArray.length = this.maxHistorySize;
+        }
+        if (type === 'tx') {
+            this.lastUpdateTime.tx = new Date();
+        } else if (type === 'md5') {
+            this.lastUpdateTime.md5 = new Date();
+        }
+    }
+
+    // Phân tích thống kê (giữ lại cho các phương thức cũ)
+    analyzeHistory(history, recentCount = 10) {
+        if (history.length === 0) return null;
+        const total = history.length;
+        let tai = 0, xiu = 0;
+        history.forEach(s => {
+            const tong = s.d1 + s.d2 + s.d3;
+            if (tong >= 11) tai++; else xiu++;
+        });
+        const recent = history.slice(0, Math.min(recentCount, history.length));
+        let recentTai = 0, recentXiu = 0;
+        recent.forEach(s => {
+            const tong = s.d1 + s.d2 + s.d3;
+            if (tong >= 11) recentTai++; else recentXiu++;
+        });
+        return {
+            total, tai, xiu,
+            recentCount: recent.length,
+            recentTai, recentXiu,
+            taiRatio: tai / total,
+            xiuRatio: xiu / total,
+            recentTaiRatio: recentTai / recent.length,
+            recentXiuRatio: recentXiu / recent.length
+        };
+    }
+
+    // Dự đoán đơn giản (giữ lại)
+    predict(method = 'simple', type = 'tx') {
+        const history = type === 'tx' ? this.historyTx : this.historyMd5;
+        if (history.length === 0) {
+            return { error: 'Không có dữ liệu lịch sử để dự đoán' };
+        }
+        const stats = this.analyzeHistory(history);
+        let prediction, confidence;
+        if (method === 'simple') {
+            if (stats.tai > stats.xiu) {
+                prediction = 'tài';
+                confidence = stats.tai / stats.total;
+            } else if (stats.xiu > stats.tai) {
+                prediction = 'xỉu';
+                confidence = stats.xiu / stats.total;
+            } else {
+                prediction = 'tài';
+                confidence = 0.5;
+            }
+        } else if (method === 'trend') {
+            if (stats.recentTai > stats.recentXiu) {
+                prediction = 'tài';
+                confidence = stats.recentTai / stats.recentCount;
+            } else if (stats.recentXiu > stats.recentTai) {
+                prediction = 'xỉu';
+                confidence = stats.recentXiu / stats.recentCount;
+            } else {
+                prediction = 'tài';
+                confidence = 0.5;
+            }
+        } else if (method === 'combined') {
+            const wRecent = 0.7, wOverall = 0.3;
+            const overallTai = stats.tai / stats.total;
+            const overallXiu = stats.xiu / stats.total;
+            const recentTai = stats.recentTai / stats.recentCount;
+            const recentXiu = stats.recentXiu / stats.recentCount;
+            const combinedTai = overallTai * wOverall + recentTai * wRecent;
+            const combinedXiu = overallXiu * wOverall + recentXiu * wRecent;
+            if (combinedTai > combinedXiu) {
+                prediction = 'tài';
+                confidence = combinedTai;
+            } else {
+                prediction = 'xỉu';
+                confidence = combinedXiu;
+            }
+        } else {
+            return { error: 'Phương thức không hợp lệ' };
+        }
+        confidence = Math.round(confidence * 100) / 100;
+        return {
+            prediction,
+            confidence,
+            stats: {
+                total: stats.total,
+                tai: stats.tai,
+                xiu: stats.xiu,
+                recentCount: stats.recentCount,
+                recentTai: stats.recentTai,
+                recentXiu: stats.recentXiu
+            },
+            method,
+            timestamp: new Date().toISOString()
+        };
+    }
+
+    predictTx(method = 'simple') {
+        return this.predict(method, 'tx');
+    }
+
+    predictMd5(method = 'simple') {
+        return this.predict(method, 'md5');
+    }
+
+    // ==================== DỰ ĐOÁN NÂNG CAO ====================
+    // Phân tích 100 phiên gần nhất, trả về xác suất tài/xỉu
+    analyze100Sessions(type = 'tx') {
+        const history = type === 'tx' ? this.historyTx : this.historyMd5;
+        if (history.length === 0) return null;
+
+        // Lấy tối đa 100 phiên gần nhất
+        const recent = history.slice(0, Math.min(100, history.length));
+        const total = recent.length;
+        let tai = 0, xiu = 0;
+        const results = []; // lưu kết quả để phân tích chuỗi
+
+        recent.forEach(s => {
+            const tong = s.d1 + s.d2 + s.d3;
+            const isTai = tong >= 11;
+            if (isTai) tai++; else xiu++;
+            results.push(isTai ? 'T' : 'X');
+        });
+
+        // Tỷ lệ tổng thể
+        const overallTaiProb = tai / total;
+        const overallXiuProb = xiu / total;
+
+        // Tỷ lệ 20 phiên gần nhất (xu hướng ngắn hạn)
+        const shortTerm = results.slice(0, Math.min(20, results.length));
+        const shortTai = shortTerm.filter(r => r === 'T').length;
+        const shortXiu = shortTerm.length - shortTai;
+        const shortTaiProb = shortTerm.length > 0 ? shortTai / shortTerm.length : 0.5;
+        const shortXiuProb = shortTerm.length > 0 ? shortXiu / shortTerm.length : 0.5;
+
+        // Phân tích Markov bậc 1: xác suất chuyển tiếp
+        let transTT = 0, transTX = 0, transXT = 0, transXX = 0;
+        for (let i = 0; i < results.length - 1; i++) {
+            if (results[i] === 'T' && results[i+1] === 'T') transTT++;
+            else if (results[i] === 'T' && results[i+1] === 'X') transTX++;
+            else if (results[i] === 'X' && results[i+1] === 'T') transXT++;
+            else if (results[i] === 'X' && results[i+1] === 'X') transXX++;
+        }
+
+        const lastResult = results[0]; // kết quả phiên gần nhất
+        let markovTaiProb = 0.5, markovXiuProb = 0.5;
+
+        if (lastResult === 'T') {
+            const totalT = transTT + transTX;
+            markovTaiProb = totalT > 0 ? transTT / totalT : 0.5;
+            markovXiuProb = totalT > 0 ? transTX / totalT : 0.5;
+        } else if (lastResult === 'X') {
+            const totalX = transXT + transXX;
+            markovTaiProb = totalX > 0 ? transXT / totalX : 0.5;
+            markovXiuProb = totalX > 0 ? transXX / totalX : 0.5;
+        }
+
+        // Phát hiện streak (5 phiên gần nhất)
+        const streak = results.slice(0, Math.min(5, results.length));
+        const streakTai = streak.filter(r => r === 'T').length;
+        const streakXiu = streak.length - streakTai;
+        let streakBias = 0;
+        if (streakTai === 5) streakBias = -0.1; // 5 tài liên tiếp, khả năng xỉu tăng nhẹ
+        else if (streakXiu === 5) streakBias = 0.1; // 5 xỉu liên tiếp, khả năng tài tăng nhẹ
+        else if (streakTai === 4) streakBias = -0.05;
+        else if (streakXiu === 4) streakBias = 0.05;
+
+        // Kết hợp các yếu tố với trọng số
+        const wOverall = 0.2;
+        const wShort = 0.3;
+        const wMarkov = 0.5;
+
+        let combinedTaiProb = overallTaiProb * wOverall + shortTaiProb * wShort + markovTaiProb * wMarkov + streakBias;
+        let combinedXiuProb = overallXiuProb * wOverall + shortXiuProb * wShort + markovXiuProb * wMarkov - streakBias;
+
+        // Chuẩn hóa về tổng 1
+        const totalProb = combinedTaiProb + combinedXiuProb;
+        combinedTaiProb = totalProb > 0 ? combinedTaiProb / totalProb : 0.5;
+        combinedXiuProb = 1 - combinedTaiProb;
+
+        return {
+            taiProb: combinedTaiProb,
+            xiuProb: combinedXiuProb,
+            totalSessions: total
+        };
+    }
+
+    // Dự đoán phiên tiếp theo (trả về format yêu cầu)
+    predictNext(type = 'tx') {
+        const history = type === 'tx' ? this.historyTx : this.historyMd5;
+        if (history.length === 0) {
+            return { error: 'Không có dữ liệu lịch sử để dự đoán' };
+        }
+
+        // Lấy phiên gần nhất
+        const latest = history[0];
+        if (!latest) return { error: 'Không tìm thấy phiên gần nhất' };
+
+        const tong = latest.d1 + latest.d2 + latest.d3;
+        const ketQua = tong >= 11 ? 'Tài' : 'Xỉu';
+        const phienHienTai = latest.sid + 1; // Giả sử sid tăng dần
+
+        // Phân tích nâng cao
+        const analysis = this.analyze100Sessions(type);
+        if (!analysis) return { error: 'Không thể phân tích dữ liệu' };
+
+        // Dự đoán
+        const duDoan = analysis.taiProb > analysis.xiuProb ? 'Tài' : 'Xỉu';
+        const confidence = analysis.taiProb > analysis.xiuProb ? analysis.taiProb : analysis.xiuProb;
+
+        return {
+            phien: latest.sid,
+            xuc_xac_1: latest.d1,
+            xuc_xac_2: latest.d2,
+            xuc_xac_3: latest.d3,
+            tong: tong,
+            ket_qua: ketQua,
+            phien_hien_tai: phienHienTai,
+            du_doan: duDoan,
+            ti_le: Math.round(confidence * 100) + '%', // Tỉ lệ phần trăm
+            confidence: Math.round(confidence * 100) / 100,
+            phan_tich: {
+                tong_so_phien: analysis.totalSessions,
+                xac_suat_tai: Math.round(analysis.taiProb * 100) / 100,
+                xac_suat_xiu: Math.round(analysis.xiuProb * 100) / 100
+            }
+        };
+    }
+
+    handleMessage(data) {
+        try {
+            const parsed = JSON.parse(data);
+            // XỬ LÝ CMD 1005 - BÀN TÀI XỈU THƯỜNG
+            if (parsed[0] === 5 && parsed[1] && parsed[1].cmd === 1005) {
+                console.log('🎯 Nhận được dữ liệu cmd 1005 (Bàn TX)');
+                const gameData = parsed[1];
+                if (gameData.htr && gameData.htr.length > 0) {
+                    this.updateHistory(this.historyTx, gameData.htr, 'tx');
+                    const latestSession = this.historyTx[0];
+                    console.log(`🎲 Bàn TX - Phiên gần nhất: ${latestSession.sid} (${latestSession.d1},${latestSession.d2},${latestSession.d3})`);
+                    this.latestTxData = gameData;
+                    console.log(`💾 Đã cập nhật dữ liệu bàn TX. Tổng số phiên lưu: ${this.historyTx.length}`);
+                }
+            }
+            // XỬ LÝ CMD 1105 - BÀN MD5
+            else if (parsed[0] === 5 && parsed[1] && parsed[1].cmd === 1105) {
+                console.log('🎯 Nhận được dữ liệu cmd 1105 (Bàn MD5)');
+                const gameData = parsed[1];
+                if (gameData.htr && gameData.htr.length > 0) {
+                    this.updateHistory(this.historyMd5, gameData.htr, 'md5');
+                    const latestSession = this.historyMd5[0];
+                    console.log(`🎲 Bàn MD5 - Phiên gần nhất: ${latestSession.sid} (${latestSession.d1},${latestSession.d2},${latestSession.d3})`);
+                    this.latestMd5Data = gameData;
+                    console.log(`💾 Đã cập nhật dữ liệu bàn MD5. Tổng số phiên lưu: ${this.historyMd5.length}`);
+                }
+            }
+            // Xử lý response authentication (type 5, có cmd 100)
+            else if (parsed[0] === 5 && parsed[1] && parsed[1].cmd === 100) {
+                console.log('🔑 Authentication successful!');
+                const userData = parsed[1];
+                console.log(`✅ User: ${userData.u}`);
+                this.isAuthenticated = true;
+                setTimeout(() => {
+                    console.log('🔄 Starting to send plugin messages...');
+                    this.sendPluginMessages();
+                }, 2000);
+            }
+            // Xử lý response type 1 - Session initialization
+            else if (parsed[0] === 1 && parsed.length >= 5 && parsed[4] === "MiniGame") {
+                console.log('✅ Session initialized');
+                this.sessionId = parsed[3];
+                console.log(`📋 Session ID: ${this.sessionId}`);
+            }
+            // Xử lý response type 7 - Plugin response
+            else if (parsed[0] === 7) {
+                const pluginName = parsed[2];
+                console.log(`🔄 Plugin ${pluginName} response received`);
+            }
+            // Xử lý heartbeat/ping response
+            else if (parsed[0] === 0) {
+                console.log('❤️  Heartbeat received');
+            }
+        } catch (e) {
+            console.log('📥 Raw message:', data.toString());
+            console.error('❌ Parse error:', e.message);
+        }
+    }
+
+    getLatestTxSession() {
+        if (!this.latestTxData || !this.latestTxData.htr || this.latestTxData.htr.length === 0) {
+            return { error: "Không có dữ liệu bàn TX", message: "Chưa nhận được dữ liệu từ server hoặc dữ liệu trống" };
+        }
+        try {
+            const latestSession = this.latestTxData.htr.reduce((prev, current) => (current.sid > prev.sid) ? current : prev);
+            const tong = latestSession.d1 + latestSession.d2 + latestSession.d3;
+            const ket_qua = (tong >= 11) ? "tài" : "xỉu";
+            return {
+                phien: latestSession.sid,
+                xuc_xac_1: latestSession.d1,
+                xuc_xac_2: latestSession.d2,
+                xuc_xac_3: latestSession.d3,
+                tong: tong,
+                ket_qua: ket_qua,
+                timestamp: new Date().toISOString(),
+                ban: "tai_xiu",
+                last_updated: this.lastUpdateTime.tx ? this.lastUpdateTime.tx.toISOString() : null
+            };
+        } catch (error) {
+            return { error: "Lỗi xử lý dữ liệu TX", message: error.message };
+        }
+    }
+
+    getLatestMd5Session() {
+        if (!this.latestMd5Data || !this.latestMd5Data.htr || this.latestMd5Data.htr.length === 0) {
+            return { error: "Không có dữ liệu bàn MD5", message: "Chưa nhận được dữ liệu từ server hoặc dữ liệu trống" };
+        }
+        try {
+            const latestSession = this.latestMd5Data.htr.reduce((prev, current) => (current.sid > prev.sid) ? current : prev);
+            const tong = latestSession.d1 + latestSession.d2 + latestSession.d3;
+            const ket_qua = (tong >= 11) ? "tài" : "xỉu";
+            return {
+                phien: latestSession.sid,
+                xuc_xac_1: latestSession.d1,
+                xuc_xac_2: latestSession.d2,
+                xuc_xac_3: latestSession.d3,
+                tong: tong,
+                ket_qua: ket_qua,
+                timestamp: new Date().toISOString(),
+                ban: "md5",
+                last_updated: this.lastUpdateTime.md5 ? this.lastUpdateTime.md5.toISOString() : null
+            };
+        } catch (error) {
+            return { error: "Lỗi xử lý dữ liệu MD5", message: error.message };
+        }
+    }
+
+    handleReconnect() {
+        if (this.reconnectAttempts < this.maxReconnectAttempts) {
+            this.reconnectAttempts++;
+            const delay = this.reconnectDelay * this.reconnectAttempts;
+            console.log(`🔄 Attempting to reconnect in ${delay}ms (Attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
+            setTimeout(() => {
+                console.log('🔄 Reconnecting...');
+                this.connect();
+            }, delay);
+        } else {
+            console.log('❌ Max reconnection attempts reached');
+        }
+    }
+
+    startHeartbeat() {
+        setInterval(() => {
+            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                const heartbeatMsg = [0, this.sessionId || ""];
+                this.sendRaw(heartbeatMsg);
+                console.log('❤️  Sending heartbeat...');
+            }
+        }, 25000);
+    }
+
+    close() {
+        if (this.ws) {
+            this.ws.close();
+        }
+    }
+}
+
+// KHỞI TẠO EXPRESS SERVER
+const app = express();
+const PORT = process.env.PORT || 3000;
+app.use(cors());
+app.use(express.json());
+
+// Tạo WebSocket client với URL mới
+const client = new GameWebSocketClient(
+    'wss://api.khuatuish.vip/websocket?d=Ykdoa2FXeGtadz09fDI2fDE3NjY1NTY2NDczMzZ8MGE5OGQ2OTE2ZjRhOWQ1NDhjYjcyNWUwOWQ3ZTU4NmJ8ZDI5MzI3MTNhZDhkZjQ0YTdkODUyYTVmNjFlNmQzNGY='
+);
+client.connect();
+
+// Routes API cũ
+app.get('/api/tx', (req, res) => {
+    const data = client.getLatestTxSession();
+    if (data.error) return res.status(404).json(data);
+    res.json(data);
+});
+
+app.get('/api/md5', (req, res) => {
+    const data = client.getLatestMd5Session();
+    if (data.error) return res.status(404).json(data);
+    res.json(data);
+});
+
+app.get('/api/all', (req, res) => {
+    const txSession = client.getLatestTxSession();
+    const md5Session = client.getLatestMd5Session();
+    res.json({
+        tai_xiu: txSession.error ? { error: txSession.error } : txSession,
+        md5: md5Session.error ? { error: md5Session.error } : md5Session,
+        timestamp: new Date().toISOString()
+    });
+});
+
+app.get('/api/status', (req, res) => {
+    const hasTxData = client.latestTxData && client.latestTxData.htr && client.latestTxData.htr.length > 0;
+    const hasMd5Data = client.latestMd5Data && client.latestMd5Data.htr && client.latestMd5Data.htr.length > 0;
+    res.json({
+        status: "running",
+        websocket_connected: client.ws ? client.ws.readyState === WebSocket.OPEN : false,
+        authenticated: client.isAuthenticated,
+        has_tx_data: hasTxData,
+        has_md5_data: hasMd5Data,
+        tx_last_updated: client.lastUpdateTime.tx ? client.lastUpdateTime.tx.toISOString() : null,
+        md5_last_updated: client.lastUpdateTime.md5 ? client.lastUpdateTime.md5.toISOString() : null,
+        tx_history_count: client.historyTx.length,
+        md5_history_count: client.historyMd5.length,
+        timestamp: new Date().toISOString()
+    });
+});
+
+app.get('/api/refresh', (req, res) => {
+    if (client.isAuthenticated && client.ws && client.ws.readyState === WebSocket.OPEN) {
+        client.refreshGameData();
+        res.json({ message: "Đã gửi yêu cầu refresh dữ liệu", timestamp: new Date().toISOString() });
+    } else {
+        res.status(400).json({ error: "Không thể refresh", message: "WebSocket chưa kết nối hoặc chưa xác thực" });
+    }
+});
+
+// API DỰ ĐOÁN CŨ (giữ lại cho tương thích)
+app.get('/api/predict/tx', (req, res) => {
+    const method = req.query.method || 'simple';
+    const result = client.predictTx(method);
+    if (result.error) return res.status(404).json(result);
+    res.json(result);
+});
+
+app.get('/api/predict/md5', (req, res) => {
+    const method = req.query.method || 'simple';
+    const result = client.predictMd5(method);
+    if (result.error) return res.status(404).json(result);
+    res.json(result);
+});
+
+// API LỊCH SỬ CŨ
+app.get('/api/history/tx', (req, res) => {
+    const limit = parseInt(req.query.limit) || 20;
+    const history = client.historyTx.slice(0, limit);
+    res.json({
+        count: history.length,
+        data: history.map(s => ({
+            sid: s.sid,
+            d1: s.d1,
+            d2: s.d2,
+            d3: s.d3,
+            tong: s.d1 + s.d2 + s.d3,
+            ket_qua: (s.d1 + s.d2 + s.d3) >= 11 ? 'tài' : 'xỉu'
+        }))
+    });
+});
+
+app.get('/api/history/md5', (req, res) => {
+    const limit = parseInt(req.query.limit) || 20;
+    const history = client.historyMd5.slice(0, limit);
+    res.json({
+        count: history.length,
+        data: history.map(s => ({
+            sid: s.sid,
+            d1: s.d1,
+            d2: s.d2,
+            d3: s.d3,
+            tong: s.d1 + s.d2 + s.d3,
+            ket_qua: (s.d1 + s.d2 + s.d3) >= 11 ? 'tài' : 'xỉu'
+        }))
+    });
+});
+
+// ========== API DỰ ĐOÁN NÂNG CAO MỚI ==========
+// Dự đoán nâng cao cho bàn Tài Xỉu thường (format theo yêu cầu)
+app.get('/api/predict/next', (req, res) => {
+    const result = client.predictNext('tx');
+    if (result.error) return res.status(404).json(result);
+    res.json(result);
+});
+
+// Dự đoán nâng cao cho bàn MD5
+app.get('/api/predict/next/md5', (req, res) => {
+    const result = client.predictNext('md5');
+    if (result.error) return res.status(404).json(result);
+    res.json(result);
+});
+
+// Route hỗ trợ tham số type (tx hoặc md5)
+app.get('/api/predict/next/:type', (req, res) => {
+    const type = req.params.type === 'md5' ? 'md5' : 'tx';
+    const result = client.predictNext(type);
+    if (result.error) return res.status(404).json(result);
+    res.json(result);
+});
+
+app.get('/', (req, res) => {
+    res.send(`
+        <html>
+            <head><title>API Zing88 Tài Xỉu + Dự đoán nâng cao</title></head>
+            <body>
+                <h1>🚀 API Zing88 Tài Xỉu + Dự đoán nâng cao</h1>
+                <p>Các endpoint:</p>
+                <ul>
+                    <li><code>/api/tx</code> – Phiên tài xỉu thường gần nhất</li>
+                    <li><code>/api/md5</code> – Phiên MD5 gần nhất</li>
+                    <li><code>/api/all</code> – Cả hai bàn</li>
+                    <li><code>/api/status</code> – Trạng thái kết nối</li>
+                    <li><code>/api/refresh</code> – Refresh dữ liệu</li>
+                    <li><code>/api/history/tx?limit=20</code> – Lịch sử bàn thường</li>
+                    <li><code>/api/history/md5?limit=20</code> – Lịch sử bàn MD5</li>
+                    <li><code>/api/predict/tx?method=simple</code> – Dự đoán cơ bản (simple/trend/combined)</li>
+                    <li><code>/api/predict/md5?method=simple</code> – Dự đoán cơ bản cho MD5</li>
+                    <li><code>/api/predict/next</code> – <b>Dự đoán nâng cao bàn TX (có tỉ lệ %) </b></li>
+                    <li><code>/api/predict/next/md5</code> – Dự đoán nâng cao bàn MD5</li>
+                </ul>
+                <p>Ví dụ: <a href="/api/predict/next">/api/predict/next</a></p>
+            </body>
+        </html>
+    `);
+});
+
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Server đang chạy tại: http://localhost:${PORT}`);
+});
+
+setTimeout(() => {
+    client.startHeartbeat();
+}, 10000);
+
+process.on('SIGINT', () => {
+    console.log('\n👋 Closing WebSocket connection and server...');
+    client.close();
+    process.exit();
+});
+
+module.exports = { GameWebSocketClient, app };
